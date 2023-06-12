@@ -1502,7 +1502,7 @@ static command_response_t _measurements_interval_cb(char * args)
         p[0] = 0;
         p = skip_space(p+1);
     }
-    if (p && isdigit(p[0]))
+    if (p && isdigit((int)p[0]))
     {
         uint8_t new_interval = strtoul(p, NULL, 10);
 
@@ -1544,7 +1544,7 @@ static command_response_t _measurements_samplecount_cb(char * args)
         p[0] = 0;
         p = skip_space(p+1);
     }
-    if (p && isdigit(p[0]))
+    if (p && isdigit((int)p[0]))
     {
         uint8_t new_samplecount = strtoul(p, NULL, 10);
 
