@@ -12,6 +12,7 @@
 #include "common.h"
 #include "base_types.h"
 #include "persist_config.h"
+#include "mqtt.h"
 
 #include "protocol.h"
 
@@ -23,13 +24,16 @@
 #define SVRUSR_LEN 12
 #define SVRPW_LEN  32
 
+#define JSON_BUF_SIZE  1024
+#define JSON_CLOSE_SIZE 2
+
 static char _mac[16] = {0};
 
 static volatile bool _has_ip_addr = false;
 static volatile bool _has_mqtt = false;
 static volatile int _qos = 1;
 
-static esp_mqtt_client_handle_t _client;
+static esp_mqtt_client_handle_t _client = NULL;
 
 static char _cmd[32];
 static volatile bool _cmd_ready = false;
@@ -37,12 +41,17 @@ static volatile bool _cmd_ready = false;
 static bool _wifi_started = false;
 static bool _mqtt_started = false;
 
+static char _json_buf[JSON_BUF_SIZE];
+static unsigned _json_buf_pos = 0;
+
+
 typedef struct
 {
     uint8_t  type;
     uint8_t  authmode;
     uint16_t autostart:1;
-    uint16_t _:15;
+    uint16_t fwd_uart:1;
+    uint16_t _:14;
     char ssid[SSID_LEN];
     char password[WFPW_LEN];
     char svr[SVR_LEN];
@@ -82,18 +91,18 @@ static bool _mqtt_send(const char * topic, const char * value, unsigned len)
     }
     else
     {
-        comms_debug("Sent MQTT \"%s\" : \"%.*s\" (%d)", topic, len, value, msg_id);
+        comms_debug("Sent MQTT \"%s\" (%d)", topic, msg_id);
         return true;
     }
 }
 
 
-static bool _mqtt_meas_send(const char * name, const char * value, unsigned len)
+static bool _mqtt_meas_send(void)
 {
     char topic[64];
-    snprintf(topic, sizeof(topic), "osm/%s/measurements/%s", _mac, name);
+    snprintf(topic, sizeof(topic), "osm/%s/measurements", _mac);
     topic[sizeof(topic)-1] = 0;
-    return _mqtt_send(topic, value, len);
+    return _mqtt_send(topic, _json_buf, 0);
 }
 
 
@@ -109,6 +118,18 @@ static osm_wifi_config_t* _wifi_get_config(void)
 }
 
 
+void mqtt_uart_forward(const char * data, unsigned size)
+{
+    osm_wifi_config_t* osm_config = _wifi_get_config();
+    if (!osm_config || !_has_mqtt || !osm_config->fwd_uart)
+        return;
+    char topic[64];
+    snprintf(topic, sizeof(topic), "osm/%s/fwd", _mac);
+    topic[sizeof(topic)-1] = 0;
+    _mqtt_send(topic, data, size);
+}
+
+
 static void _mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
@@ -119,10 +140,9 @@ static void _mqtt_event_handler(void *handler_args, esp_event_base_t base, int32
             _has_mqtt = true;
             comms_debug("MQTT connected.");
             char topic[32];
-            snprintf(topic, sizeof(topic), "/osm/%s/cmd", _mac);
+            snprintf(topic, sizeof(topic), "osm/%s/cmd", _mac);
             topic[sizeof(topic)-1] = 0;
             esp_mqtt_client_subscribe(client, topic, 0);
-            _mqtt_meas_send("mqtt_conn", "connected", strlen("connected"));
             break;
         case MQTT_EVENT_DISCONNECTED:
             _has_mqtt = false;
@@ -270,26 +290,61 @@ void protocol_system_init(void)
 }
 
 
+
+static bool _protocol_append_v(char * fmt, va_list ap)
+{
+    unsigned available = JSON_BUF_SIZE - _json_buf_pos;
+    unsigned r = vsnprintf(_json_buf + _json_buf_pos, available, fmt, ap);
+    if ((r + JSON_CLOSE_SIZE) >= available)
+        return false;
+    _json_buf_pos += r;
+    return true;
+}
+
+
+static bool _protocol_append(char * fmt, ...) PRINTF_FMT_CHECK(1, 2);
+static bool _protocol_append(char * fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    bool r = _protocol_append_v(fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+
 bool protocol_init(void)
 {
-    return _has_mqtt;
+    if (!_has_mqtt)
+        return false;
+    _json_buf_pos = 0;
+    return _protocol_append("{");
 }
+
+
+static bool _protocol_append_meas(char * fmt, ...) PRINTF_FMT_CHECK(1, 2);
+static bool _protocol_append_meas(char * fmt, ...)
+{
+    if (_json_buf[_json_buf_pos - 1] != '{')
+        if (!_protocol_append(","))
+            return false;
+    va_list ap;
+    va_start(ap, fmt);
+    bool r = _protocol_append_v(fmt, ap);
+    va_end(ap);
+    return r;
+}
+
 
 static bool _protocol_append_data_type_float(const char * name, int32_t value)
 {
-    char svalue[16];
-    unsigned len = snprintf(svalue, sizeof(svalue), "%"PRId32".%03ld", value/1000, labs(value/1000));
-    svalue[sizeof(svalue)-1]=0;
-    return _mqtt_meas_send(name, svalue, len);
+    return _protocol_append_meas("\"%s\" : %"PRId32".%03ld", name, value/1000, labs(value%1000));
 }
 
 
 static bool _protocol_append_data_type_i64(const char * name, int64_t value)
 {
-    char svalue[24];
-    unsigned len = snprintf(svalue, sizeof(svalue), "%"PRId64, value);
-    svalue[sizeof(svalue)-1]=0;
-    return _mqtt_meas_send(name, svalue, len);
+    return _protocol_append_meas("\"%s\" : %"PRId64, name, value);
 }
 
 
@@ -298,6 +353,7 @@ static bool _protocol_append_value_type_float(const char * name, measurements_da
     if (data->num_samples == 1)
         return _protocol_append_data_type_float(name, data->value.value_f.sum);
     bool r = true;
+    unsigned init_pos = _json_buf_pos;
     int32_t mean = data->value.value_f.sum / data->num_samples;
     char tmp[MEASURE_NAME_NULLED_LEN + 4];
     r &= _protocol_append_data_type_float(name, mean);
@@ -305,7 +361,12 @@ static bool _protocol_append_value_type_float(const char * name, measurements_da
     r &= _protocol_append_data_type_float(tmp, data->value.value_f.min);
     snprintf(tmp, sizeof(tmp), "%s_max", name);
     r &= _protocol_append_data_type_float(tmp, data->value.value_f.max);
-    return r;
+    if (!r)
+    {
+        _json_buf_pos = init_pos;
+        return false;
+    }
+    return true;
 }
 
 
@@ -314,6 +375,7 @@ static bool _protocol_append_value_type_i64(const char * name, measurements_data
     if (data->num_samples == 1)
         return _protocol_append_data_type_i64(name, data->value.value_f.sum);
     bool r = true;
+    unsigned init_pos = _json_buf_pos;
     int64_t mean = data->value.value_64.sum / data->num_samples;
     char tmp[MEASURE_NAME_NULLED_LEN + 4];
     r &= _protocol_append_data_type_i64(name, mean);
@@ -321,6 +383,11 @@ static bool _protocol_append_value_type_i64(const char * name, measurements_data
     r &= _protocol_append_data_type_i64(tmp, data->value.value_64.min);
     snprintf(tmp, sizeof(tmp), "%s_max", name);
     r &= _protocol_append_data_type_i64(tmp, data->value.value_64.max);
+    if (!r)
+    {
+        _json_buf_pos = init_pos;
+        return false;
+    }
     return r;
 }
 
@@ -328,7 +395,7 @@ static bool _protocol_append_value_type_i64(const char * name, measurements_data
 
 static bool _protocol_append_value_type_str(const char * name, measurements_data_t* data)
 {
-    return _mqtt_meas_send(name, data->value.value_s.str, strlen(data->value.value_s.str));
+    return _protocol_append_meas("\"%s\" : \"%s\"", name, data->value.value_s.str);
 }
 
 
@@ -358,12 +425,14 @@ bool        protocol_append_instant_measurement(measurements_def_t* def, measure
 
 void        protocol_debug(void)
 {
-    vTaskDelay(200 / portTICK_PERIOD_MS);
-    comms_debug("batch complete (debug)");
+    protocol_send();
 }
 
 void        protocol_send(void)
 {
+    if (!_protocol_append("}"))
+        return;
+    _mqtt_meas_send();
     vTaskDelay(200 / portTICK_PERIOD_MS);
     comms_debug("batch complete.");
 }
@@ -537,10 +606,24 @@ static command_response_t _auto_start_cb(char *args)
 {
     osm_wifi_config_t* osm_config = _wifi_get_config();
     if (*args && osm_config)
-            osm_config->autostart = (args[0] == '1') || (tolower(args[0]) == 't');
+        osm_config->autostart = (args[0] == '1') || (tolower(args[0]) == 't');
     if (osm_config)
     {
         log_out("Autostart : %u", (unsigned)osm_config->autostart);
+        return COMMAND_RESP_OK;
+    }
+    return COMMAND_RESP_ERR;
+}
+
+
+static command_response_t _fwd_cb(char *args)
+{
+    osm_wifi_config_t* osm_config = _wifi_get_config();
+    if (*args && osm_config)
+        osm_config->fwd_uart = (args[0] == '1') || (tolower(args[0]) == 't');
+    if (osm_config)
+    {
+        log_out("MQTT UART forwarding : %u", (unsigned)osm_config->fwd_uart);
         return COMMAND_RESP_OK;
     }
     return COMMAND_RESP_ERR;
@@ -558,6 +641,7 @@ static command_response_t _esp_comms_cb(char *args)
         { "mqtt_usr",   "Get/Set MQTT user", _mqtt_usr_cb                       , false , NULL },
         { "mqtt_pw",   "Get/Set MQTT password", _mqtt_pw_cb                       , false , NULL },
         { "autostart",   "Get/Set connection auto start", _auto_start_cb                       , false , NULL },
+        { "uart_fwd", "Enable/Disable UART MQTT forwarding", _fwd_cb, false , NULL },
     };
     command_response_t r = COMMAND_RESP_ERR;
     if (args[0])
